@@ -1,13 +1,12 @@
 """
-Taiwan Stock Analyst - 每日台股分析報告
-使用 yfinance 抓資料 + Claude API 分析 + Gmail 發送報告
+Taiwan Stock Analyst - 每日台股數據報告
+使用 yfinance 抓資料 + Gmail 發送報告（純數據版，不需要 API Key）
 """
 
 import os
 import json
 import smtplib
 import yfinance as yf
-import anthropic
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -16,7 +15,6 @@ from zoneinfo import ZoneInfo
 # ─── 設定 ────────────────────────────────────────────────
 TW_TZ = ZoneInfo("Asia/Taipei")
 TODAY = datetime.now(TW_TZ).strftime("%Y/%m/%d")
-YESTERDAY = (datetime.now(TW_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 # ─── 1. 讀取持股清單 ─────────────────────────────────────
@@ -27,54 +25,46 @@ def load_portfolio(path: str = "stocks.json") -> list[dict]:
 
 # ─── 2. 抓 yfinance 資料 ─────────────────────────────────
 def fetch_stock_data(symbol: str) -> dict:
-    """抓單一股票昨日資料"""
     try:
         ticker = yf.Ticker(symbol)
-
-        # 抓近 5 天資料（確保拿得到最新交易日）
         hist = ticker.history(period="5d")
         if hist.empty:
-            return {"error": f"無法取得 {symbol} 資料"}
+            return {"error": f"無法取得 {symbol} 資料", "symbol": symbol}
 
         latest = hist.iloc[-1]
         prev   = hist.iloc[-2] if len(hist) >= 2 else hist.iloc[-1]
 
-        # 基本資訊
         info = ticker.info
 
-        # 技術指標（簡易版）
         closes = hist["Close"].tolist()
         ma5    = sum(closes[-5:]) / min(5, len(closes))
         ma20_data = ticker.history(period="1mo")["Close"]
         ma20   = ma20_data.mean() if not ma20_data.empty else latest["Close"]
 
-        # RSI（14日）
         rsi_data = ticker.history(period="3mo")["Close"]
         rsi = calculate_rsi(rsi_data.tolist()) if len(rsi_data) >= 14 else None
 
         return {
-            "symbol": symbol,
-            "close":  round(float(latest["Close"]), 2),
-            "open":   round(float(latest["Open"]),  2),
-            "high":   round(float(latest["High"]),  2),
-            "low":    round(float(latest["Low"]),   2),
-            "volume": int(latest["Volume"]),
-            "change": round(float(latest["Close"] - prev["Close"]), 2),
+            "symbol":     symbol,
+            "close":      round(float(latest["Close"]), 2),
+            "open":       round(float(latest["Open"]),  2),
+            "high":       round(float(latest["High"]),  2),
+            "low":        round(float(latest["Low"]),   2),
+            "volume":     int(latest["Volume"]),
+            "change":     round(float(latest["Close"] - prev["Close"]), 2),
             "change_pct": round(float((latest["Close"] - prev["Close"]) / prev["Close"] * 100), 2),
-            "ma5":    round(ma5,  2),
-            "ma20":   round(ma20, 2),
-            "rsi":    round(rsi, 2) if rsi else "N/A",
-            "52w_high": info.get("fiftyTwoWeekHigh", "N/A"),
-            "52w_low":  info.get("fiftyTwoWeekLow",  "N/A"),
-            "pe_ratio": info.get("trailingPE", "N/A"),
-            "market_cap": info.get("marketCap", "N/A"),
+            "ma5":        round(ma5,  2),
+            "ma20":       round(ma20, 2),
+            "rsi":        round(rsi, 2) if rsi else "N/A",
+            "52w_high":   info.get("fiftyTwoWeekHigh", "N/A"),
+            "52w_low":    info.get("fiftyTwoWeekLow",  "N/A"),
+            "pe_ratio":   info.get("trailingPE", "N/A"),
         }
     except Exception as e:
         return {"error": str(e), "symbol": symbol}
 
 
 def calculate_rsi(closes: list[float], period: int = 14) -> float:
-    """計算 RSI"""
     if len(closes) < period + 1:
         return 50.0
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
@@ -88,8 +78,17 @@ def calculate_rsi(closes: list[float], period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
+def rsi_label(rsi) -> str:
+    if rsi == "N/A":
+        return "N/A", "#64748b"
+    if rsi >= 70:
+        return f"{rsi} 超買", "#dc2626"
+    if rsi <= 30:
+        return f"{rsi} 超賣", "#16a34a"
+    return f"{rsi} 中性", "#64748b"
+
+
 def fetch_market_overview() -> dict:
-    """抓大盤與相關指數"""
     indices = {
         "台灣加權指數": "^TWII",
         "費城半導體":   "^SOX",
@@ -114,67 +113,128 @@ def fetch_market_overview() -> dict:
     return result
 
 
-# ─── 3. Claude 分析 ──────────────────────────────────────
-def analyze_with_claude(portfolio: list[dict], stocks_data: list[dict], market: dict) -> str:
-    """呼叫 Claude API 進行深度分析"""
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+# ─── 3. 組合個股詳細卡片 ─────────────────────────────────
+def build_stock_cards(portfolio: list[dict], stocks_data: list[dict]) -> str:
+    cards = ""
+    for s in stocks_data:
+        meta  = next((p for p in portfolio if p["symbol"] == s.get("symbol")), {})
+        name  = meta.get("name", s.get("symbol", ""))
+        sym   = s.get("symbol", "")
 
-    # 組合持股資訊（加入成本）
-    enriched = []
-    for stock_data in stocks_data:
-        meta = next((p for p in portfolio if p["symbol"] == stock_data.get("symbol")), {})
-        if "error" not in stock_data:
-            cost       = meta.get("avg_cost", 0)
-            close      = stock_data["close"]
-            pnl_pct    = round((close - cost) / cost * 100, 2) if cost else "N/A"
-            enriched.append({**stock_data, **meta, "pnl_pct": pnl_pct})
+        if "error" in s:
+            cards += f"""
+            <div style="background:#fff7f7;border:1px solid #fecaca;border-radius:10px;padding:16px;margin-bottom:12px;">
+              <strong style="color:#dc2626;">{sym} {name}</strong>
+              <p style="color:#dc2626;margin:4px 0 0;font-size:13px;">⚠️ 資料抓取失敗：{s['error']}</p>
+            </div>"""
+            continue
+
+        cost    = meta.get("avg_cost", 0)
+        shares  = meta.get("shares", 0)
+        sector  = meta.get("sector", "")
+        close   = s["close"]
+        chg     = s["change_pct"]
+        pnl     = round((close - cost) / cost * 100, 2) if cost else 0
+        pnl_tw  = round((close - cost) * shares, 0) if cost and shares else 0
+
+        chg_color  = "#16a34a" if chg >= 0  else "#dc2626"
+        pnl_color  = "#16a34a" if pnl >= 0  else "#dc2626"
+        chg_arrow  = "▲" if chg >= 0 else "▼"
+        pnl_sign   = "+" if pnl >= 0 else ""
+
+        # MA 訊號
+        ma_signal = ""
+        if s["ma5"] > s["ma20"]:
+            ma_signal = '<span style="color:#16a34a;font-size:12px;">● MA5 > MA20 多頭排列</span>'
         else:
-            enriched.append({**stock_data, **meta})
+            ma_signal = '<span style="color:#dc2626;font-size:12px;">● MA5 < MA20 空頭排列</span>'
 
-    prompt = f"""
-你是一位專業的台股分析師，請根據以下資料，為投資人撰寫今日（{TODAY}）的個股分析報告。
+        # RSI
+        rsi_val = s.get("rsi", "N/A")
+        if rsi_val != "N/A":
+            if rsi_val >= 70:
+                rsi_html = f'<span style="color:#dc2626;">{rsi_val} ⚠️ 超買區</span>'
+            elif rsi_val <= 30:
+                rsi_html = f'<span style="color:#16a34a;">{rsi_val} 💡 超賣區</span>'
+            else:
+                rsi_html = f'<span style="color:#64748b;">{rsi_val} 中性</span>'
+        else:
+            rsi_html = "N/A"
 
-## 大盤環境
-{json.dumps(market, ensure_ascii=False, indent=2)}
+        # 52週位置
+        w52h = s.get("52w_high", "N/A")
+        w52l = s.get("52w_low",  "N/A")
+        if w52h != "N/A" and w52l != "N/A":
+            try:
+                pct_from_high = round((close - w52h) / w52h * 100, 1)
+                w52_html = f'{w52l} ~ {w52h}（距高點 {pct_from_high}%）'
+            except:
+                w52_html = f'{w52l} ~ {w52h}'
+        else:
+            w52_html = "N/A"
 
-## 持股資料
-{json.dumps(enriched, ensure_ascii=False, indent=2)}
+        cards += f"""
+        <div style="background:#ffffff;border:1px solid #e2e8f0;border-radius:10px;padding:20px;margin-bottom:16px;">
+          <!-- 標題列 -->
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
+            <div>
+              <span style="font-size:17px;font-weight:700;color:#1e293b;">{sym}</span>
+              <span style="font-size:15px;color:#475569;margin-left:6px;">{name}</span>
+              <span style="font-size:11px;color:#94a3b8;margin-left:8px;background:#f1f5f9;padding:2px 6px;border-radius:4px;">{sector}</span>
+            </div>
+            <div style="text-align:right;">
+              <span style="font-size:22px;font-weight:700;color:#1e293b;">{close}</span>
+              <span style="font-size:14px;color:{chg_color};font-weight:600;margin-left:8px;">{chg_arrow} {abs(chg)}%</span>
+            </div>
+          </div>
 
-請針對每一檔持股，分別提供以下分析（用繁體中文）：
+          <!-- 數據格線 -->
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px;">
+            <div style="background:#f8fafc;border-radius:6px;padding:10px;text-align:center;">
+              <div style="font-size:11px;color:#94a3b8;margin-bottom:3px;">開盤</div>
+              <div style="font-size:14px;font-weight:600;">{s['open']}</div>
+            </div>
+            <div style="background:#f8fafc;border-radius:6px;padding:10px;text-align:center;">
+              <div style="font-size:11px;color:#94a3b8;margin-bottom:3px;">最高</div>
+              <div style="font-size:14px;font-weight:600;color:#16a34a;">{s['high']}</div>
+            </div>
+            <div style="background:#f8fafc;border-radius:6px;padding:10px;text-align:center;">
+              <div style="font-size:11px;color:#94a3b8;margin-bottom:3px;">最低</div>
+              <div style="font-size:14px;font-weight:600;color:#dc2626;">{s['low']}</div>
+            </div>
+          </div>
 
-### 每檔個股分析格式：
-**[股票代號] 股票名稱**
-- 📊 **今日方向**：多/空/觀望（搭配信心指數 1-5 顆星）
-- 🎯 **目標價**：若看多，給出近期目標價；若看空，給出支撐價
-- 🚪 **出場價（停損）**：建議停損點位
-- ⚖️ **風險收益比**：預估風險收益比（例如 1:2.5）
-- 📈 **技術面**：MA5/MA20 位置、RSI 解讀、量價關係
-- 💡 **操作建議**：具體的操作策略（持有/加碼/減碼/觀望）
-- ⚠️ **主要風險**：1-2 個需注意的風險因子
+          <!-- 技術指標 -->
+          <div style="border-top:1px solid #f1f5f9;padding-top:12px;font-size:13px;color:#475569;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:4px;">
+              <span>📈 MA5：<strong>{s['ma5']}</strong> ／ MA20：<strong>{s['ma20']}</strong> &nbsp;{ma_signal}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:4px;">
+              <span>📊 RSI(14)：<strong>{rsi_html}</strong></span>
+              <span>P/E：{round(s['pe_ratio'], 1) if s['pe_ratio'] != 'N/A' else 'N/A'}</span>
+            </div>
+            <div style="margin-bottom:6px;">
+              <span>📅 52週區間：{w52_html}</span>
+            </div>
+          </div>
 
-### 最後加上：
-**📋 整體持倉健康度評估**
-- 持倉多空比例
-- 產業集中度風險
-- 今日最需要關注的個股（前兩名）
-- 未來 1-2 週整體趨勢判斷
-
-請保持客觀專業，數據要有所根據，不要過度樂觀。
-"""
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
+          <!-- 持倉損益 -->
+          <div style="background:#f8fafc;border-radius:6px;padding:12px;margin-top:12px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <div style="font-size:13px;color:#64748b;">
+              持股 <strong>{shares}</strong> 張 ／ 成本 <strong>{cost}</strong>
+            </div>
+            <div style="font-size:14px;font-weight:700;color:{pnl_color};">
+              {pnl_sign}{pnl}%　（{pnl_sign}{int(pnl_tw):,} 元）
+            </div>
+          </div>
+        </div>"""
+    return cards
 
 
 # ─── 4. 組合 HTML 報告 ───────────────────────────────────
-def build_html_report(analysis: str, portfolio: list[dict], stocks_data: list[dict], market: dict) -> str:
-    """把 Claude 分析結果包裝成漂亮的 HTML Email"""
+def build_html_report(portfolio: list[dict], stocks_data: list[dict], market: dict) -> str:
 
-    # 大盤摘要 HTML
+    # 大盤列
     market_rows = ""
     for name, data in market.items():
         val = data["value"]
@@ -188,121 +248,82 @@ def build_html_report(analysis: str, portfolio: list[dict], stocks_data: list[di
           <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;color:{color};font-weight:600;">{arrow} {abs(chg)}%</td>
         </tr>"""
 
-    # 持股快覽 HTML
-    stock_rows = ""
+    # 持倉總損益
+    total_pnl = 0
     for s in stocks_data:
-        if "error" in s:
-            continue
-        meta   = next((p for p in portfolio if p["symbol"] == s["symbol"]), {})
-        cost   = meta.get("avg_cost", 0)
-        close  = s["close"]
-        pnl    = round((close - cost) / cost * 100, 2) if cost else 0
-        chg    = s["change_pct"]
-        color  = "#16a34a" if chg >= 0 else "#dc2626"
-        pcolor = "#16a34a" if pnl >= 0 else "#dc2626"
-        arrow  = "▲" if chg >= 0 else "▼"
-        stock_rows += f"""
-        <tr>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;">{s['symbol']}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;">{meta.get('name','')}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;font-weight:600;">{close}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;color:{color};">{arrow} {abs(chg)}%</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;">{cost}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;color:{pcolor};font-weight:600;">{'+' if pnl>=0 else ''}{pnl}%</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;">{s.get('rsi','N/A')}</td>
-        </tr>"""
+        if "error" not in s:
+            meta  = next((p for p in portfolio if p["symbol"] == s["symbol"]), {})
+            cost  = meta.get("avg_cost", 0)
+            shares = meta.get("shares", 0)
+            if cost and shares:
+                total_pnl += (s["close"] - cost) * shares
+    total_color = "#16a34a" if total_pnl >= 0 else "#dc2626"
+    total_sign  = "+" if total_pnl >= 0 else ""
 
-    # Markdown → HTML（簡易轉換）
-    import re
-    analysis_html = analysis.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    analysis_html = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', analysis_html)
-    analysis_html = re.sub(r'\*(.+?)\*',     r'<em>\1</em>',         analysis_html)
-    analysis_html = re.sub(r'^### (.+)$',    r'<h3 style="color:#1e40af;margin-top:20px;">\1</h3>', analysis_html, flags=re.MULTILINE)
-    analysis_html = re.sub(r'^## (.+)$',     r'<h2 style="color:#1e3a8a;border-bottom:2px solid #dbeafe;padding-bottom:6px;">\1</h2>', analysis_html, flags=re.MULTILINE)
-    analysis_html = re.sub(r'^- (.+)$',      r'<li style="margin:4px 0;">\1</li>', analysis_html, flags=re.MULTILINE)
-    analysis_html = analysis_html.replace("\n\n", "</p><p>").replace("\n", "<br>")
-    analysis_html = f"<p>{analysis_html}</p>"
+    stock_cards = build_stock_cards(portfolio, stocks_data)
 
-    return f"""
-<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
-  <title>台股每日分析報告 {TODAY}</title>
+  <title>台股每日報告 {TODAY}</title>
 </head>
-<body style="margin:0;padding:0;background:#f8fafc;font-family:'Helvetica Neue',Arial,sans-serif;color:#1e293b;">
-  <div style="max-width:680px;margin:0 auto;padding:24px 16px;">
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Helvetica Neue',Arial,sans-serif;color:#1e293b;">
+<div style="max-width:680px;margin:0 auto;padding:24px 16px;">
 
-    <!-- Header -->
-    <div style="background:linear-gradient(135deg,#1e3a8a,#2563eb);border-radius:12px;padding:28px 32px;margin-bottom:24px;">
-      <div style="color:#93c5fd;font-size:13px;margin-bottom:6px;">📅 {TODAY} · 台股每日分析</div>
-      <h1 style="color:#ffffff;margin:0;font-size:24px;font-weight:700;">AI 持倉分析報告</h1>
-      <p style="color:#bfdbfe;margin:8px 0 0;font-size:14px;">由 Claude AI 分析師自動生成</p>
-    </div>
-
-    <!-- 大盤環境 -->
-    <div style="background:#ffffff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-      <h2 style="margin:0 0 16px;font-size:16px;color:#1e293b;">🌏 大盤環境</h2>
-      <table style="width:100%;border-collapse:collapse;font-size:14px;">
-        <tr style="background:#f8fafc;">
-          <th style="padding:8px 12px;text-align:left;color:#64748b;font-weight:500;">指數</th>
-          <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">收盤</th>
-          <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">漲跌幅</th>
-        </tr>
-        {market_rows}
-      </table>
-    </div>
-
-    <!-- 持股快覽 -->
-    <div style="background:#ffffff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-      <h2 style="margin:0 0 16px;font-size:16px;color:#1e293b;">📊 持股快覽</h2>
-      <div style="overflow-x:auto;">
-        <table style="width:100%;border-collapse:collapse;font-size:13px;">
-          <tr style="background:#f8fafc;">
-            <th style="padding:8px 12px;text-align:left;color:#64748b;font-weight:500;">代號</th>
-            <th style="padding:8px 12px;text-align:left;color:#64748b;font-weight:500;">名稱</th>
-            <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">收盤價</th>
-            <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">今日漲跌</th>
-            <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">成本</th>
-            <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">損益%</th>
-            <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">RSI</th>
-          </tr>
-          {stock_rows}
-        </table>
-      </div>
-    </div>
-
-    <!-- Claude 分析 -->
-    <div style="background:#ffffff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-      <h2 style="margin:0 0 20px;font-size:16px;color:#1e293b;">🤖 AI 深度分析</h2>
-      <div style="font-size:14px;line-height:1.8;color:#334155;">
-        {analysis_html}
-      </div>
-    </div>
-
-    <!-- Footer -->
-    <div style="text-align:center;color:#94a3b8;font-size:12px;padding:16px;">
-      <p style="margin:0;">⚠️ 本報告由 AI 自動生成，僅供參考，不構成投資建議。投資有風險，請自行判斷。</p>
-      <p style="margin:8px 0 0;">Taiwan Stock Analyst · Powered by Claude &amp; yfinance</p>
-    </div>
-
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#0f172a,#1e40af);border-radius:14px;padding:28px 32px;margin-bottom:20px;">
+    <div style="color:#93c5fd;font-size:13px;margin-bottom:6px;">📅 {TODAY} · 台股每日數據報告</div>
+    <h1 style="color:#ffffff;margin:0 0 4px;font-size:22px;font-weight:700;">持倉數據報告</h1>
+    <p style="color:#bfdbfe;margin:0;font-size:13px;">由 yfinance 自動抓取 · 每個交易日 08:00 發送</p>
   </div>
+
+  <!-- 總損益 -->
+  <div style="background:#ffffff;border-radius:12px;padding:20px 24px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);display:flex;justify-content:space-between;align-items:center;">
+    <div style="color:#64748b;font-size:14px;">📋 持倉總損益（未實現）</div>
+    <div style="font-size:22px;font-weight:700;color:{total_color};">{total_sign}{int(total_pnl):,} 元</div>
+  </div>
+
+  <!-- 大盤環境 -->
+  <div style="background:#ffffff;border-radius:12px;padding:20px 24px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+    <h2 style="margin:0 0 14px;font-size:15px;color:#1e293b;font-weight:600;">🌏 大盤環境</h2>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <tr style="background:#f8fafc;">
+        <th style="padding:8px 12px;text-align:left;color:#64748b;font-weight:500;">指數</th>
+        <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">收盤</th>
+        <th style="padding:8px 12px;text-align:right;color:#64748b;font-weight:500;">漲跌幅</th>
+      </tr>
+      {market_rows}
+    </table>
+  </div>
+
+  <!-- 個股卡片 -->
+  <div style="margin-bottom:16px;">
+    <h2 style="font-size:15px;color:#1e293b;font-weight:600;margin:0 0 12px;">📊 個股詳細數據</h2>
+    {stock_cards}
+  </div>
+
+  <!-- Footer -->
+  <div style="text-align:center;color:#94a3b8;font-size:12px;padding:16px 0;">
+    <p style="margin:0;">⚠️ 本報告為自動抓取的數據彙整，不構成投資建議。投資有風險，請自行判斷。</p>
+    <p style="margin:6px 0 0;">Taiwan Stock Analyst · Powered by yfinance</p>
+  </div>
+
+</div>
 </body>
-</html>
-"""
+</html>"""
 
 
 # ─── 5. 發送 Email ───────────────────────────────────────
 def send_email(html_content: str, subject: str):
-    """透過 Gmail SMTP 發送 HTML 報告"""
     sender    = os.environ["GMAIL_USER"]
     password  = os.environ["GMAIL_APP_PASSWORD"]
     recipient = os.environ["RECIPIENT_EMAIL"]
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = f"台股 AI 分析師 <{sender}>"
+    msg["From"]    = f"台股數據報告 <{sender}>"
     msg["To"]      = recipient
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
@@ -314,31 +335,21 @@ def send_email(html_content: str, subject: str):
 
 # ─── 主程式 ──────────────────────────────────────────────
 def main():
-    print(f"🚀 開始執行台股分析 [{TODAY}]")
+    print(f"🚀 開始執行台股報告 [{TODAY}]")
 
-    # 1. 讀取持股清單
     portfolio = load_portfolio("stocks.json")
-    symbols   = [s["symbol"] for s in portfolio]
     print(f"📋 持股清單：{[s['name'] for s in portfolio]}")
 
-    # 2. 抓大盤資料
     print("🌏 抓取大盤資料...")
     market = fetch_market_overview()
 
-    # 3. 抓個股資料
     print("📈 抓取個股資料...")
-    stocks_data = [fetch_stock_data(sym) for sym in symbols]
+    stocks_data = [fetch_stock_data(s["symbol"]) for s in portfolio]
 
-    # 4. Claude 分析
-    print("🤖 Claude 分析中...")
-    analysis = analyze_with_claude(portfolio, stocks_data, market)
-
-    # 5. 組合報告
     print("📝 組合 HTML 報告...")
-    html = build_html_report(analysis, portfolio, stocks_data, market)
+    html = build_html_report(portfolio, stocks_data, market)
 
-    # 6. 發送 Email
-    subject = f"📊 台股 AI 分析報告 {TODAY}"
+    subject = f"📊 台股數據報告 {TODAY}"
     send_email(html, subject)
     print("✅ 完成！")
 
