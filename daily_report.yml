@@ -1,0 +1,32 @@
+name: 台股每日分析報告
+
+on:
+  schedule:
+    # 每天台灣時間 08:00 = UTC 00:00
+    - cron: "0 0 * * 1-5"   # 週一到週五（跳過週末）
+  workflow_dispatch:          # 允許手動觸發（測試用）
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stock analyst
+        env:
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:    ${{ secrets.RECIPIENT_EMAIL }}
+        run: python src/analyst.py
